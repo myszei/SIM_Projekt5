@@ -6,6 +6,8 @@ sim_browser
 # Pliki systemowe
 .DS_Store
 *.swp
+.vscode/
 
 # Foldery
 obj/
+SIM_ARCHIVE/
