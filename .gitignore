@@ -1,0 +1,11 @@
+# Pliki binarne i obiektowe
+*.o
+sim_importer
+sim_browser
+
+# Pliki systemowe
+.DS_Store
+*.swp
+
+# Foldery
+obj/
