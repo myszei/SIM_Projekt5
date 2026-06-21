@@ -25,24 +25,62 @@ void trim(std::string& s) {
     s = s.substr(first, last - first + 1);
 }
 
-std::string sanitizeForSQL(const std::string& input) {
+// --- KROK 1: NARZĘDZIA DO CZYSZCZENIA DANYCH ---
+
+void replaceAll(std::string& str, const std::string& from, const std::string& to) {
+    if(from.empty()) return;
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); 
+    }
+}
+
+// Podmienia znaki z innych alfabetów na ich bezpieczne odpowiedniki
+std::string removeDiacritics(std::string s) {
+    replaceAll(s, "ą", "a"); replaceAll(s, "ć", "c"); replaceAll(s, "ę", "e");
+    replaceAll(s, "ł", "l"); replaceAll(s, "ń", "n"); replaceAll(s, "ó", "o");
+    replaceAll(s, "ś", "s"); replaceAll(s, "ź", "z"); replaceAll(s, "ż", "z");
+    replaceAll(s, "é", "e"); replaceAll(s, "ü", "u"); replaceAll(s, "ö", "o");
+    
+    replaceAll(s, "Ą", "A"); replaceAll(s, "Ć", "C"); replaceAll(s, "Ę", "E");
+    replaceAll(s, "Ł", "L"); replaceAll(s, "Ń", "N"); replaceAll(s, "Ó", "O");
+    replaceAll(s, "Ś", "S"); replaceAll(s, "Ź", "Z"); replaceAll(s, "Ż", "Z");
+    replaceAll(s, "É", "E"); replaceAll(s, "Ü", "U"); replaceAll(s, "Ö", "O");
+    return s;
+}
+
+std::string sanitizeForPath(std::string input) {
+    input = removeDiacritics(input);
     std::string output;
     for (char c : input) {
         unsigned char uc = static_cast<unsigned char>(c);
-        if (uc < 32 || uc > 126) {
-            output += ' '; 
-        } else if (c == '\'') {
-            output += "''"; 
-        } else {
+        // Bezpieczne sprawdzanie czy znak to litera/cyfra
+        if (isalnum(uc) || c == '-' || c == '_') {
             output += c;
+        } else if (c == ' ' || c == '^') {
+            output += '_';
         }
     }
-    trim(output); // Zawsze czyscimy tez spacje po bokach!
+    return output;
+}
+
+// Poprawiona funkcja dla bazy danych (nie psuje folderów i usuwa daszki DICOM!)
+std::string sanitizeForSQL(const std::string& input) {
+    std::string normalized = removeDiacritics(input);
+    std::string output;
+    for (char c : normalized) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 32 || uc > 126) continue;
+        else if (c == '\'') output += "''"; 
+        else output += c;
+    }
+    trim(output);
     return output;
 }
 
 // =========================================================================
-// NOWOŚĆ: BEZPIECZNA DATA (Odrzuca spacje i uszkodzone daty DICOM)
+// BEZPIECZNA DATA (Odrzuca spacje i uszkodzone daty DICOM)
 // =========================================================================
 std::string safeDate(std::string dateStr) {
     dateStr = sanitizeForSQL(dateStr);
@@ -51,6 +89,20 @@ std::string safeDate(std::string dateStr) {
         return "NULL";
     }
     return "'" + dateStr + "'";
+}
+
+// =========================================================================
+// BEZPIECZNA PŁEĆ (Wymusza max 1 znak dla SQL: M, F, O, w przeciwnym razie NULL)
+// =========================================================================
+std::string safeSex(std::string sexStr) {
+    sexStr = sanitizeForSQL(sexStr);
+    if (sexStr.empty()) return "NULL";
+    
+    char c = toupper(sexStr[0]); // Bierzemy tylko PIERWSZĄ literę i powiększamy
+    if (c == 'M' || c == 'F' || c == 'O') {
+        return std::string("'") + c + "'";
+    }
+    return "NULL"; // Jeśli to śmieci (np. "Unknown"), dajemy bezpieczny NULL
 }
 
 SQLHDBC connectToDatabase() {
@@ -93,7 +145,7 @@ void indexDirectory(SQLHDBC hDbc) {
     int filesProcessed = 0;
     std::cout << "Indeksowanie plikow... prosze czekac.\n";
 
-    for (const auto& entry : fs::recursive_directory_iterator(targetDir)) {
+    for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
         if (entry.is_regular_file()) {
             DicomMetadata data;
             if (extractDicomMetadata(entry.path().string(), data)) {
@@ -106,16 +158,15 @@ void indexDirectory(SQLHDBC hDbc) {
                 // Używamy bezpiecznej daty i bezpiecznej płci
                 std::string s_bDate = safeDate(data.birthDate);
                 std::string s_sDate = safeDate(data.studyDate);
-                std::string s_sex = sanitizeForSQL(data.patientSex).empty() ? "NULL" : "'" + sanitizeForSQL(data.patientSex) + "'";
-
+                std::string s_sex = safeSex(data.patientSex);
                 std::string insertPatient = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
                 
                 if (!SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertPatient.c_str(), SQL_NTS))) {
                     printOdbcError(hStmt, SQL_HANDLE_STMT);
                 }
 
-                std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(data.filePath) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id;";
-                
+                std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(data.filePath) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id, study_desc = EXCLUDED.study_desc;";
+
                 if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertStudy.c_str(), SQL_NTS))) {
                     filesProcessed++;
                 } else {
@@ -153,22 +204,32 @@ void importDirectory(SQLHDBC hDbc) {
     int filesProcessed = 0;
     std::cout << "Analiza i kopiowanie plikow do SIM_ARCHIVE...\n";
 
-    for (const auto& entry : fs::recursive_directory_iterator(targetDir)) {
+    for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
         if (entry.is_regular_file()) {
             std::string originalPath = entry.path().string();
             DicomMetadata data;
             
             if (extractDicomMetadata(originalPath, data)) {
-                std::string folderName = data.patientName.empty() ? data.patientId : data.patientName + "_" + data.patientId;
-                std::replace(folderName.begin(), folderName.end(), ' ', '_');
-                std::replace(folderName.begin(), folderName.end(), '^', '_');
-                folderName = sanitizeForSQL(folderName);
                 
-                std::string patientFolder = managedStorage + "/" + folderName;
+                // 1. FOLDER GŁÓWNY PACJENTA (Tylko ID Pacjenta)
+                std::string safePatientId = sanitizeForPath(data.patientId);
+                if (safePatientId.empty()) safePatientId = "UNKNOWN_PATIENT"; // Zabezpieczenie
+                
+                std::string patientFolder = managedStorage + "/" + safePatientId;
                 if (!fs::exists(patientFolder)) fs::create_directories(patientFolder);
                 
-                std::string destPath = patientFolder + "/" + data.sopUid + ".dcm";
+                // 2. PODFOLDER BADANIA (Modalność + Opis)
+                std::string safeModality = sanitizeForPath(data.modality.empty() ? "UNKNOWN" : data.modality);
+                std::string safeDesc = sanitizeForPath(data.studyDesc.empty() ? "BRAK_OPISU" : data.studyDesc);
+                
+                // Struktura: np. MR_Guz_mozgu
+                std::string studySubfolder = patientFolder + "/" + safeModality + "_" + safeDesc;
+                if (!fs::exists(studySubfolder)) fs::create_directories(studySubfolder);
+                
+                // 3. FIZYCZNA ŚCIEŻKA DO PLIKU
+                std::string destPath = studySubfolder + "/" + sanitizeForPath(data.sopUid) + ".dcm";
                 std::string absoluteDest = fs::absolute(destPath).string();
+
 
                 std::string s_id = sanitizeForSQL(data.patientId);
                 std::string s_name = sanitizeForSQL(data.patientName);
@@ -178,16 +239,15 @@ void importDirectory(SQLHDBC hDbc) {
                 // Zabezpieczenie DATY!
                 std::string s_bDate = safeDate(data.birthDate);
                 std::string s_sDate = safeDate(data.studyDate);
-                std::string s_sex = sanitizeForSQL(data.patientSex).empty() ? "NULL" : "'" + sanitizeForSQL(data.patientSex) + "'";
-
+                std::string s_sex = safeSex(data.patientSex);
                 std::string insertPatient = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
                 
                 if (!SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertPatient.c_str(), SQL_NTS))) {
                     printOdbcError(hStmt, SQL_HANDLE_STMT);
                 }
-
-                std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(absoluteDest) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id;";
                 
+                std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(absoluteDest) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id, study_desc = EXCLUDED.study_desc;";
+
                 if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertStudy.c_str(), SQL_NTS))) {
                     fs::copy_file(originalPath, destPath, fs::copy_options::overwrite_existing);
                     filesProcessed++;
@@ -202,7 +262,7 @@ void importDirectory(SQLHDBC hDbc) {
 }
 
 // =========================================================================
-// POTĘŻNA, DWUKIERUNKOWA SYNCHRONIZACJA (TWO-WAY SYNC) - WERSJA POPRAWIONA
+// DWUKIERUNKOWA SYNCHRONIZACJA (TWO-WAY SYNC)
 // =========================================================================
 void syncDatabase(SQLHDBC hDbc) {
     std::cout << "\n--- URUCHAMIANIE DWUKIERUNKOWEJ SYNCHRONIZACJI SYSTEMU ---\n";
@@ -242,37 +302,50 @@ void syncDatabase(SQLHDBC hDbc) {
     int autoRegistered = 0;
 
     if (fs::exists(managedStorage)) {
-        std::cout << "[Krok 2/2] Skanowanie Archiwum w poszukiwaniu recznie dodanych folderów...\n";
+        std::cout << "[Krok 2/2] Skanowanie Archiwum w poszukiwaniu recznie dodanych plikow...\n";
         
-        for (const auto& entry : fs::recursive_directory_iterator(managedStorage)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".dcm") {
+        // Iterator omija zablokowane foldery systemowe
+        for (const auto& entry : fs::recursive_directory_iterator(managedStorage, fs::directory_options::skip_permission_denied)) {
+            
+            // Program skanuje każdy plik, niezależnie od rozszerzenia (nawet te bez kropki)
+            if (entry.is_regular_file()) { 
                 std::string currentPath = fs::absolute(entry.path()).string();
-                std::string fileUid = entry.path().stem().string(); 
-
-                std::string checkQuery = "SELECT COUNT(*) FROM studies WHERE study_uid = '" + sanitizeForSQL(fileUid) + "';";
-                SQLExecDirect(hStmt, (SQLCHAR*)checkQuery.c_str(), SQL_NTS);
                 
-                SQLCHAR countStr[20]; SQLLEN cbCount;
-                int exists = 0;
-                if (SQLFetch(hStmt) == SQL_SUCCESS) {
-                    SQLGetData(hStmt, 1, SQL_C_CHAR, countStr, sizeof(countStr), &cbCount);
-                    exists = std::stoi((char*)countStr);
-                }
-                SQLFreeStmt(hStmt, SQL_CLOSE);
+                DicomMetadata data;
+                // Otwieramy plik - jeśli to DICOM, wejdzie w warunek. NIfTI i inne zostaną zignorowane.
+                if (extractDicomMetadata(currentPath, data)) {
+                    std::string s_uid = sanitizeForSQL(data.sopUid);
+                    
+                    // Sprawdzamy w bazie, czy ten konkretny UID badania już istnieje
+                    std::string checkQuery = "SELECT COUNT(*) FROM studies WHERE study_uid = '" + s_uid + "';";
+                    SQLExecDirect(hStmt, (SQLCHAR*)checkQuery.c_str(), SQL_NTS);
+                    
+                    SQLCHAR countStr[20]; SQLLEN cbCount;
+                    int exists = 0;
+                    if (SQLFetch(hStmt) == SQL_SUCCESS) {
+                        SQLGetData(hStmt, 1, SQL_C_CHAR, countStr, sizeof(countStr), &cbCount);
+                        exists = std::stoi((char*)countStr);
+                    }
+                    SQLFreeStmt(hStmt, SQL_CLOSE);
 
-                if (exists == 0) {
-                    DicomMetadata data;
-                    if (extractDicomMetadata(currentPath, data)) {
+                    // Jeśli pliku nie ma w bazie, ratujemy sytuację i go rejestrujemy!
+                    if (exists == 0) {
                         std::string s_id = sanitizeForSQL(data.patientId);
                         std::string s_name = sanitizeForSQL(data.patientName);
-                        std::string s_uid = sanitizeForSQL(data.sopUid);
                         std::string s_desc = sanitizeForSQL(data.studyDesc);
+                        
+                        // Korzystamy z naszych bezpiecznych funkcji (zabezpieczenie przed błędami SQL)
+                        std::string s_bDate = safeDate(data.birthDate);
+                        std::string s_sDate = safeDate(data.studyDate);
+                        std::string s_sex = safeSex(data.patientSex);
 
-                        std::string insPat = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', '" + safeDate(data.birthDate) + "', '" + sanitizeForSQL(data.patientSex) + "') ON CONFLICT DO NOTHING;";
+                        // Wklejamy pacjenta (zmienne safeDate i safeSex generują własne apostrofy lub czyste słowo NULL)
+                        std::string insPat = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
                         SQLExecDirect(hStmt, (SQLCHAR*)insPat.c_str(), SQL_NTS);
 
-                        // Ważne: ON CONFLICT DO NOTHING, żeby nie psuć stanu usuniętych z innych źródeł
-                        std::string insStd = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', 1, '" + sanitizeForSQL(data.modality) + "', " + safeDate(data.studyDate) + ", '" + s_desc + "', '" + sanitizeForSQL(currentPath) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT DO NOTHING;";
+                        // Wklejamy badanie
+                        std::string insStd = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', 1, '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(currentPath) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT DO NOTHING;";
+                        
                         if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insStd.c_str(), SQL_NTS))) {
                             autoRegistered++;
                         }
@@ -285,6 +358,8 @@ void syncDatabase(SQLHDBC hDbc) {
     std::cout << "--- SYNCHRONIZACJA ZAKONCZONA SUKCESEM ---\n";
     SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
 }
+
+
 
 // =========================================================================
 // 3. ZAAWANSOWANE WYSZUKIWANIE (KORZYSTA Z FUNKCJI TRIM NAPISANEJ WYŻEJ)
@@ -380,7 +455,7 @@ void searchPatient(SQLHDBC hDbc) {
 }
 
 
-// NOWOŚĆ: Generowanie statystyk z wykorzystaniem potęgi SQL
+// Generowanie statystyk z wykorzystaniem potęgi SQL
 void showStatistics(SQLHDBC hDbc) {
     std::cout << "\n--- STATYSTYKI SYSTEMU ---\n";
     SQLHSTMT hStmt; SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
