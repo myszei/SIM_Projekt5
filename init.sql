@@ -34,5 +34,13 @@ CREATE TABLE IF NOT EXISTS studies (
     is_deleted BOOLEAN DEFAULT false
 );
 
+-- Zmiana właściciela tabel na użytkownika programu
+ALTER TABLE data_sources OWNER TO sim_user;
+ALTER TABLE patients OWNER TO sim_user;
+ALTER TABLE studies OWNER TO sim_user;
+
+-- Przekazanie praw do edycji i korzystania z liczników (SERIAL)
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO sim_user;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO sim_user;
 -- Informacja o zakończeniu
 \echo 'Struktura bazy SIM_MEDICAL_DB zostala poprawnie utworzona!'
