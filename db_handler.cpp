@@ -65,7 +65,7 @@ std::string sanitizeForPath(std::string input) {
     return output;
 }
 
-// Poprawiona funkcja dla bazy danych (nie psuje folderów i usuwa daszki DICOM!)
+// Poprawiona funkcja dla bazy danych 
 std::string sanitizeForSQL(const std::string& input) {
     std::string normalized = removeDiacritics(input);
     std::string output;
@@ -311,7 +311,7 @@ void syncDatabase(SQLHDBC hDbc) {
         SQLGetData(hStmt, 2, SQL_C_CHAR, path, sizeof(path), &cbPath);
         
         std::string checkPath = (char*)path;
-        trim(checkPath); // CZYSZCZENIE ŚCIEŻKI!
+        trim(checkPath); // CZYSZCZENIE ŚCIEŻKI
 
         // Jeśli plik nie istnieje (albo jest ścieżką sieciową Windowsa, którą wykasowano)
         if (!fs::exists(checkPath) || !fs::is_regular_file(checkPath)) {
@@ -359,7 +359,7 @@ void syncDatabase(SQLHDBC hDbc) {
                     }
                     SQLFreeStmt(hStmt, SQL_CLOSE);
 
-                    // Jeśli pliku nie ma w bazie, ratujemy sytuację i go rejestrujemy!
+                    // Jeśli pliku nie ma w bazie, rejestrujemy go
                     if (exists == 0) {
                         std::string s_id = sanitizeForSQL(data.patientId);
                         std::string s_name = sanitizeForSQL(data.patientName);
