@@ -125,11 +125,11 @@ void disconnectDatabase(SQLHDBC hDbc) {
 
 void indexDirectory(SQLHDBC hDbc) {
     std::string targetDir;
-    std::cout << "\nPodaj sciezke do katalogu do ZAINDEKSOWANIA: ";
+    std::cout << "\nPodaj sciezke do katalogu lub pliku do ZAINDEKSOWANIA: ";
     std::getline(std::cin, targetDir);
     trim(targetDir);
 
-    if (!fs::exists(targetDir)) { std::cerr << "BLAD: Katalog nie istnieje!\n"; return; }
+    if (!fs::exists(targetDir)) { std::cerr << "BLAD: Sciezka nie istnieje!\n"; return; }
 
     SQLHSTMT hStmt; SQLAllocHandle(SQL_HANDLE_STMT, hDbc, &hStmt);
 
@@ -143,35 +143,52 @@ void indexDirectory(SQLHDBC hDbc) {
     SQLBindCol(hStmt, 1, SQL_C_LONG, &sourceId, 0, &cbSourceId); SQLFetch(hStmt); SQLFreeStmt(hStmt, SQL_CLOSE);
 
     int filesProcessed = 0;
-    std::cout << "Indeksowanie plikow... prosze czekac.\n";
+    std::cout << "Analiza zrodla i przygotowanie do indeksowania...\n";
 
-    for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
-        if (entry.is_regular_file()) {
-            DicomMetadata data;
-            if (extractDicomMetadata(entry.path().string(), data)) {
-                
-                std::string s_id = sanitizeForSQL(data.patientId);
-                std::string s_name = sanitizeForSQL(data.patientName);
-                std::string s_uid = sanitizeForSQL(data.sopUid);
-                std::string s_desc = sanitizeForSQL(data.studyDesc);
-                
-                // Używamy bezpiecznej daty i bezpiecznej płci
-                std::string s_bDate = safeDate(data.birthDate);
-                std::string s_sDate = safeDate(data.studyDate);
-                std::string s_sex = safeSex(data.patientSex);
-                std::string insertPatient = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
-                
-                if (!SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertPatient.c_str(), SQL_NTS))) {
-                    printOdbcError(hStmt, SQL_HANDLE_STMT);
-                }
+    // --- Elastyczne budowanie listy plików (obsługuje i foldery, i pojedyncze pliki) ---
+    std::vector<std::string> filesToProcess;
+    
+    if (fs::is_regular_file(targetDir)) {
+        filesToProcess.push_back(targetDir);
+    } else if (fs::is_directory(targetDir)) {
+        for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
+            if (entry.is_regular_file()) {
+                filesToProcess.push_back(entry.path().string());
+            }
+        }
+    } else {
+        std::cerr << "BLAD: Sciezka nie jest prawidlowym plikiem ani katalogiem!\n";
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return;
+    }
 
-                std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(data.filePath) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id, study_desc = EXCLUDED.study_desc;";
+    std::cout << "Rozpoczynam indeksowanie " << filesToProcess.size() << " plikow...\n";
 
-                if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertStudy.c_str(), SQL_NTS))) {
-                    filesProcessed++;
-                } else {
-                    printOdbcError(hStmt, SQL_HANDLE_STMT);
-                }
+    for (const auto& pathStr : filesToProcess) {
+        DicomMetadata data;
+        if (extractDicomMetadata(pathStr, data)) {
+            
+            std::string s_id = sanitizeForSQL(data.patientId);
+            std::string s_name = sanitizeForSQL(data.patientName);
+            std::string s_uid = sanitizeForSQL(data.sopUid);
+            std::string s_desc = sanitizeForSQL(data.studyDesc);
+            
+            std::string s_bDate = safeDate(data.birthDate);
+            std::string s_sDate = safeDate(data.studyDate);
+            std::string s_sex = safeSex(data.patientSex);
+
+            std::string insertPatient = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
+            
+            if (!SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertPatient.c_str(), SQL_NTS))) {
+                printOdbcError(hStmt, SQL_HANDLE_STMT);
+            }
+
+            std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(data.filePath) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id, study_desc = EXCLUDED.study_desc;";
+
+            if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertStudy.c_str(), SQL_NTS))) {
+                filesProcessed++;
+            } else {
+                printOdbcError(hStmt, SQL_HANDLE_STMT);
             }
         }
     }
@@ -181,11 +198,11 @@ void indexDirectory(SQLHDBC hDbc) {
 
 void importDirectory(SQLHDBC hDbc) {
     std::string targetDir;
-    std::cout << "\nPodaj zrodlo danych do IMPORTU (np. zewnetrzny dysk/pendrive): ";
+    std::cout << "\nPodaj zrodlo danych do IMPORTU (np. zewnetrzny dysk/pendrive, lub pojedynczy plik): ";
     std::getline(std::cin, targetDir);
     trim(targetDir);
 
-    if (!fs::exists(targetDir)) { std::cerr << "BLAD: Katalog nie istnieje!\n"; return; }
+    if (!fs::exists(targetDir)) { std::cerr << "BLAD: Sciezka nie istnieje!\n"; return; }
 
     std::string managedStorage = "./SIM_ARCHIVE";
     if (!fs::exists(managedStorage)) fs::create_directories(managedStorage);
@@ -202,65 +219,79 @@ void importDirectory(SQLHDBC hDbc) {
     SQLBindCol(hStmt, 1, SQL_C_LONG, &sourceId, 0, &cbSourceId); SQLFetch(hStmt); SQLFreeStmt(hStmt, SQL_CLOSE);
 
     int filesProcessed = 0;
-    std::cout << "Analiza i kopiowanie plikow do SIM_ARCHIVE...\n";
+    std::cout << "Analiza zrodla i przygotowanie do operacji...\n";
 
-    for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
-        if (entry.is_regular_file()) {
-            std::string originalPath = entry.path().string();
-            DicomMetadata data;
+    // --- Elastyczne budowanie listy plików (obsługuje i foldery, i pojedyncze pliki) ---
+    std::vector<std::string> filesToProcess;
+    
+    if (fs::is_regular_file(targetDir)) {
+        filesToProcess.push_back(targetDir); // Dodajemy pojedynczy plik
+    } else if (fs::is_directory(targetDir)) {
+        for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
+            if (entry.is_regular_file()) {
+                filesToProcess.push_back(entry.path().string());
+            }
+        }
+    } else {
+        std::cerr << "BLAD: Sciezka nie jest prawidlowym plikiem ani katalogiem!\n";
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return;
+    }
+
+    std::cout << "Rozpoczynam przetwarzanie " << filesToProcess.size() << " plikow...\n";
+
+    // Główna pętla wykonawcza (przechodzi po naszej gotowej liście)
+    for (const auto& originalPath : filesToProcess) {
+        DicomMetadata data;
+        
+        if (extractDicomMetadata(originalPath, data)) {
             
-            if (extractDicomMetadata(originalPath, data)) {
-                
-                // 1. FOLDER GŁÓWNY PACJENTA (Tylko ID Pacjenta)
-                std::string safePatientId = sanitizeForPath(data.patientId);
-                if (safePatientId.empty()) safePatientId = "UNKNOWN_PATIENT"; // Zabezpieczenie
-                
-                std::string patientFolder = managedStorage + "/" + safePatientId;
-                if (!fs::exists(patientFolder)) fs::create_directories(patientFolder);
-                
-                // 2. PODFOLDER BADANIA (Modalność + Opis)
-                std::string safeModality = sanitizeForPath(data.modality.empty() ? "UNKNOWN" : data.modality);
-                std::string safeDesc = sanitizeForPath(data.studyDesc.empty() ? "BRAK_OPISU" : data.studyDesc);
-                
-                // Struktura: np. MR_Guz_mozgu
-                std::string studySubfolder = patientFolder + "/" + safeModality + "_" + safeDesc;
-                if (!fs::exists(studySubfolder)) fs::create_directories(studySubfolder);
-                
-                // 3. FIZYCZNA ŚCIEŻKA DO PLIKU
-                std::string destPath = studySubfolder + "/" + sanitizeForPath(data.sopUid) + ".dcm";
-                std::string absoluteDest = fs::absolute(destPath).string();
+            // 1. FOLDER GŁÓWNY PACJENTA (Tylko ID Pacjenta)
+            std::string safePatientId = sanitizeForPath(data.patientId);
+            if (safePatientId.empty()) safePatientId = "UNKNOWN_PATIENT"; 
+            
+            std::string patientFolder = managedStorage + "/" + safePatientId;
+            if (!fs::exists(patientFolder)) fs::create_directories(patientFolder);
+            
+            // 2. PODFOLDER BADANIA (Modalność + Opis)
+            std::string safeModality = sanitizeForPath(data.modality.empty() ? "UNKNOWN" : data.modality);
+            std::string safeDesc = sanitizeForPath(data.studyDesc.empty() ? "BRAK_OPISU" : data.studyDesc);
+            
+            std::string studySubfolder = patientFolder + "/" + safeModality + "_" + safeDesc;
+            if (!fs::exists(studySubfolder)) fs::create_directories(studySubfolder);
+            
+            // 3. FIZYCZNA ŚCIEŻKA DO PLIKU
+            std::string destPath = studySubfolder + "/" + sanitizeForPath(data.sopUid) + ".dcm";
+            std::string absoluteDest = fs::absolute(destPath).string();
 
+            std::string s_id = sanitizeForSQL(data.patientId);
+            std::string s_name = sanitizeForSQL(data.patientName);
+            std::string s_uid = sanitizeForSQL(data.sopUid);
+            std::string s_desc = sanitizeForSQL(data.studyDesc);
+            
+            std::string s_bDate = safeDate(data.birthDate);
+            std::string s_sDate = safeDate(data.studyDate);
+            std::string s_sex = safeSex(data.patientSex);
 
-                std::string s_id = sanitizeForSQL(data.patientId);
-                std::string s_name = sanitizeForSQL(data.patientName);
-                std::string s_uid = sanitizeForSQL(data.sopUid);
-                std::string s_desc = sanitizeForSQL(data.studyDesc);
-                
-                // Zabezpieczenie DATY!
-                std::string s_bDate = safeDate(data.birthDate);
-                std::string s_sDate = safeDate(data.studyDate);
-                std::string s_sex = safeSex(data.patientSex);
-                std::string insertPatient = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
-                
-                if (!SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertPatient.c_str(), SQL_NTS))) {
-                    printOdbcError(hStmt, SQL_HANDLE_STMT);
-                }
-                
-                std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(absoluteDest) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id, study_desc = EXCLUDED.study_desc;";
+            std::string insertPatient = "INSERT INTO patients (patient_id, full_name, birth_date, sex) VALUES ('" + s_id + "', '" + s_name + "', " + s_bDate + ", " + s_sex + ") ON CONFLICT DO NOTHING;";
+            
+            if (!SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertPatient.c_str(), SQL_NTS))) {
+                printOdbcError(hStmt, SQL_HANDLE_STMT);
+            }
+            
+            std::string insertStudy = "INSERT INTO studies (study_uid, patient_id, source_id, modality, study_date, study_desc, file_path, file_size) VALUES ('" + s_uid + "', '" + s_id + "', " + std::to_string(sourceId) + ", '" + sanitizeForSQL(data.modality) + "', " + s_sDate + ", '" + s_desc + "', '" + sanitizeForSQL(absoluteDest) + "', " + std::to_string(data.fileSize) + ") ON CONFLICT (study_uid) DO UPDATE SET is_deleted = false, file_path = EXCLUDED.file_path, source_id = EXCLUDED.source_id, study_desc = EXCLUDED.study_desc;";
 
-                if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertStudy.c_str(), SQL_NTS))) {
-                    fs::copy_file(originalPath, destPath, fs::copy_options::overwrite_existing);
-                    filesProcessed++;
-                } else {
-                    printOdbcError(hStmt, SQL_HANDLE_STMT);
-                }
+            if (SQL_SUCCEEDED(SQLExecDirect(hStmt, (SQLCHAR*)insertStudy.c_str(), SQL_NTS))) {
+                fs::copy_file(originalPath, destPath, fs::copy_options::overwrite_existing);
+                filesProcessed++;
+            } else {
+                printOdbcError(hStmt, SQL_HANDLE_STMT);
             }
         }
     }
     std::cout << "SUKCES: Fizycznie zabezpieczono i zapisano w bazie plikow: " << filesProcessed << "\n";
     SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
 }
-
 // =========================================================================
 // DWUKIERUNKOWA SYNCHRONIZACJA (TWO-WAY SYNC)
 // =========================================================================
