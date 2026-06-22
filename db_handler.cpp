@@ -221,7 +221,7 @@ void importDirectory(SQLHDBC hDbc) {
     int filesProcessed = 0;
     std::cout << "Analiza zrodla i przygotowanie do operacji...\n";
 
-    // --- Elastyczne budowanie listy plików (obsługuje i foldery, i pojedyncze pliki) ---
+    // -Budowanie listy plików (obsługuje i foldery, i pojedyncze pliki)
     std::vector<std::string> filesToProcess;
     
     if (fs::is_regular_file(targetDir)) {
